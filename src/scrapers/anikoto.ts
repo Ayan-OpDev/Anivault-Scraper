@@ -1,6 +1,8 @@
 import * as cheerio from 'cheerio';
 import axios from 'axios';
 import { inspect } from 'util';
+import * as crypto from 'crypto';
+import * as vm from 'vm';
 import { makeClient, makeAjaxClient } from '../utils/fetch';
 import { cacheGet, cacheSet } from '../utils/cache';
 
@@ -582,6 +584,184 @@ async function doMegacloud(embedUrl: string, html: string, referer: string, serv
 }
 
 // ── Megaplay (megaplay.buzz / vidwish.live / vidtube.site mirrors) ──
+// ── Megaplay 'enc' decryption + URL signing ──
+// megaplay.buzz's getSources endpoint stopped returning a plaintext
+// `sources.file` and now returns an `enc` blob instead. Ported from the
+// (confirmed-working) Anivexa-API reference implementation: the embed page's
+// client-side <script> is scanned for every short string literal, and each
+// one is brute-forced as an AES-256-CBC key/IV pair until decryption
+// produces valid JSON with a usable stream URL. Some hosts also require the
+// resulting URL to be HMAC-signed (a `token=` query param) using a signing
+// key pulled out of a second, differently-shaped script via a tiny sandboxed
+// eval of just the key-deriving expression.
+function decodeScriptString(value: string): string {
+  return value.replace(/\\u([\dA-Fa-f]{4})|\\x([\dA-Fa-f]{2})|\\([\\'"bnfrtv0])/g, (_, unicode, hex, escaped) => {
+    if (unicode) return String.fromCharCode(Number.parseInt(unicode, 16));
+    if (hex) return String.fromCharCode(Number.parseInt(hex, 16));
+    return ({ b: '\b', n: '\n', f: '\f', r: '\r', t: '\t', v: '\v', 0: '\0' } as Record<string, string>)[escaped] ?? escaped;
+  });
+}
+
+function getScriptStrings(script: string): string[] {
+  const strings: string[] = [];
+  let index = 0;
+  let previous = '';
+  while (index < script.length) {
+    const char = script[index];
+    if (char === '/' && script[index + 1] === '/') {
+      index = script.indexOf('\n', index + 2);
+      if (index < 0) break;
+      continue;
+    }
+    if (char === '/' && script[index + 1] === '*') {
+      index = script.indexOf('*/', index + 2);
+      if (index < 0) break;
+      index += 2;
+      continue;
+    }
+    if (char === '/' && /[=(:,[!&|?{};]/.test(previous)) {
+      index++;
+      let inClass = false;
+      while (index < script.length) {
+        if (script[index] === '\\') {
+          index += 2;
+          continue;
+        }
+        if (script[index] === '[') inClass = true;
+        if (script[index] === ']') inClass = false;
+        if (script[index] === '/' && !inClass) {
+          index++;
+          while (/[a-z]/i.test(script[index] ?? '')) index++;
+          break;
+        }
+        index++;
+      }
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      const quote = char;
+      let value = '';
+      index++;
+      while (index < script.length && script[index] !== quote) {
+        if (script[index] === '\\' && index + 1 < script.length) value += script[index++];
+        value += script[index++];
+      }
+      strings.push(decodeScriptString(value));
+      index++;
+      continue;
+    }
+    if (char === '`') {
+      index++;
+      while (index < script.length && script[index] !== '`') index += script[index] === '\\' ? 2 : 1;
+      index++;
+      continue;
+    }
+    if (!/\s/.test(char)) previous = char;
+    index++;
+  }
+  return [...new Set(strings)];
+}
+
+function decryptMegaPlaySource(value: string | undefined | null, script: string): string | null {
+  if (!value) return null;
+  const encrypted = Buffer.from(value, 'base64url');
+  if (!encrypted.length || encrypted.length % 16) return null;
+  const values = getScriptStrings(script).filter((item) => Buffer.byteLength(item) > 0 && Buffer.byteLength(item) <= 32);
+  const ivs = values.filter((item) => Buffer.byteLength(item) === 16);
+  for (const keyValue of values) {
+    const key = Buffer.alloc(32);
+    Buffer.from(keyValue).copy(key);
+    for (const ivValue of ivs) {
+      try {
+        const decipher = crypto.createDecipheriv('aes-256-cbc', key, Buffer.from(ivValue));
+        const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+        const data = JSON.parse(decrypted.toString('utf8'));
+        const source = data?.file ?? data?.url ?? data?.sources?.file ?? data?.sources?.[0]?.file;
+        if (typeof source === 'string' && source) return source;
+      } catch {
+        // wrong key/IV guess — try the next candidate
+      }
+    }
+  }
+  return null;
+}
+
+function getMegaPlaySigningKey(script: string): string | null {
+  const objectName = script.match(/\blet\s+([A-Za-z_$][\w$]*)\s*;\s*!\s*function\s*\(\)\s*\{/i)?.[1];
+  const entry = script.match(/\bconst\s+[A-Za-z_$][\w$]*\s*=\s*new URLSearchParams\b/);
+  if (!objectName || !entry) return null;
+
+  const encoderIndex = script.indexOf('new TextEncoder();return');
+  if (encoderIndex < 0) return null;
+
+  const keyVar = script
+    .slice(encoderIndex, encoderIndex + 1600)
+    .match(/new TextEncoder\(\);return[\s\S]{0,1200}?\]\(([A-Za-z_$][\w$]*)\),\{/i)?.[1];
+  if (!keyVar) return null;
+
+  const keyExpression = script.match(
+    new RegExp(`(?:const|let|var)\\s+${keyVar}\\s*=\\s*(${objectName}\\.[A-Za-z_$][\\w$]*\\(\\d+\\))`)
+  )?.[1];
+  if (!keyExpression) return null;
+
+  try {
+    const context: any = { console, decodeURI, encodeURI, Math, String, Array, Object, RegExp, Error, SyntaxError };
+    context.globalThis = context;
+    vm.createContext(context);
+    vm.runInContext(`${script.slice(0, entry.index)};globalThis.__megaPlaySigningKey=${keyExpression};`, context, {
+      timeout: 5000,
+    });
+    return typeof context.__megaPlaySigningKey === 'string' ? context.__megaPlaySigningKey : null;
+  } catch {
+    return null;
+  }
+}
+
+function signMegaPlayUrl(value: string | null, signingKey: string | null): string | null {
+  if (!value || !signingKey || /[?&]token=/i.test(value)) return value;
+  const match = String(value).match(/\/([a-f0-9]{32})\/([a-f0-9]{32})\//i);
+  if (!match) return value;
+
+  const pathKey = `${match[1].toLowerCase()}/${match[2].toLowerCase()}`;
+  const payload = `${Math.floor(Date.now() / 1000) + 90}|${pathKey}`;
+  const signature = crypto.createHmac('sha256', signingKey).update(payload).digest('base64url');
+  const token = `${Buffer.from(payload).toString('base64url')}.${signature}`;
+  const endpoint = new URL(value);
+  endpoint.searchParams.set('token', token);
+  return endpoint.href;
+}
+
+// Scans the embed page's <script src=...> tags for the client bundle (the
+// one that actually calls getSources and does AES-CBC decryption) and, if
+// present, the separate bundle responsible for signing playback URLs. Best
+// effort: any fetch/parse failure just means decryption/signing gets skipped
+// and the caller falls back to whatever plaintext field is already present.
+async function getMegaplayScripts(
+  host: string,
+  html: string,
+  referer: string
+): Promise<{ script: string | null; signingKey: string | null }> {
+  try {
+    const origin = `https://${host}/`;
+    const scriptUrls = [...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map((m) => new URL(m[1], origin).href);
+    const contents = await Promise.all(
+      scriptUrls.map((url) =>
+        axios
+          .get<string>(url, { headers: { ...DEFAULT_HEADERS, Referer: referer }, timeout: 8000 })
+          .then((res) => res.data)
+          .catch(() => null)
+      )
+    );
+    const script = contents.find((value): value is string => typeof value === 'string' && /getSources/i.test(value) && /AES-CBC/i.test(value)) ?? null;
+    const signingScript = contents.find((value): value is string => typeof value === 'string' && value.includes('[a-f0-9]{32}') && value.includes('token=')) ?? null;
+    const signingKey = signingScript ? getMegaPlaySigningKey(signingScript) : null;
+    return { script, signingKey };
+  } catch (err) {
+    log('megaplay: fetching client scripts for enc-decryption threw', errInfo(err));
+    return { script: null, signingKey: null };
+  }
+}
+
 async function doMegaplay(host: string, html: string, referer: string, serverName: string): Promise<AnikotoStream | null> {
   const match = html.match(/<title>File ([0-9]+)/);
   if (!match) {
@@ -596,10 +776,28 @@ async function doMegaplay(host: string, html: string, referer: string, serverNam
       timeout: 8000,
     });
 
-    let m3u8: string | undefined = data?.sources?.file;
+    let m3u8: string | null | undefined = data?.sources?.file;
     const subtitles: AnikotoSubtitle[] = (data?.tracks || [])
       .filter((t: any) => t?.file)
       .map((t: any) => ({ url: t.file, lang: t.label ?? 'Unknown', default: Boolean(t.default) }));
+
+    // Newer megaplay responses stop sending a plaintext sources.file and
+    // instead send an `enc` blob — decrypt it, then HMAC-sign the resulting
+    // URL if the site's client script requires a `token=` param.
+    if (!m3u8 && data?.enc) {
+      const { script, signingKey } = await getMegaplayScripts(host, html, referer);
+      if (script) {
+        const decrypted = decryptMegaPlaySource(data.enc, script);
+        if (decrypted) {
+          m3u8 = signMegaPlayUrl(decrypted, signingKey) ?? decrypted;
+          log('megaplay: decrypted enc payload', { host, id, signed: Boolean(signingKey) });
+        } else {
+          log('megaplay: enc payload present but decryption failed (no matching key/IV in client script)', { host, id });
+        }
+      } else {
+        log('megaplay: enc payload present but no AES-CBC client script found to decrypt it', { host, id });
+      }
+    }
 
     if (m3u8 && m3u8.includes('mewstream.buzz')) {
       const original = m3u8;

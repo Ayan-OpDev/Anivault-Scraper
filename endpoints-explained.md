@@ -42,6 +42,11 @@ Below is a detailed breakdown of every single API endpoint available in the AniV
 * **Description:** A proxy endpoint for routing raw video requests (such as direct `.mp4` chunks).
 * **Usage:** Acts as a secure intermediary to fetch raw video data while bypassing client-side origin restrictions.
 
+### `GET /api/download/animeheaven/:id/:ep/:type`
+* **Description:** A proxy download endpoint that fetches AnimeHeaven MP4 links and streams them as a file attachment.
+* **Parameters:** Path parameters: `id` (AniList ID or `mal-{id}` format), `ep` (episode number), and `type` (`sub`/`dub`).
+* **Usage:** Internally resolves the AnimeHeaven video stream, extracts the direct MP4, and proxies it to the user with `Content-Disposition: attachment` for easy downloading.
+
 ### `GET /api/watch`
 * **Description:** The query-parameter equivalent of the primary watch endpoint.
 * **Parameters:** `source`, `anilistId`/`malId`/`heavenId`, `ep`, `type`.

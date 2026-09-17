@@ -422,6 +422,89 @@ async function watchHandler(req: Request, res: Response) {
 
 router.get('/watch/:source/:id/:ep/:type', watchHandler);
 
+async function downloadHeavenHandler(req: Request, res: Response) {
+  const { id, ep, type } = req.params;
+  const source = 'animeheaven';
+
+  const epNum = parseInt(ep);
+  if (isNaN(epNum)) return res.status(400).json({ error: 'ep must be a number' });
+  if (!['sub', 'dub', 'raw'].includes(type)) return res.status(400).json({ error: 'type must be: sub, dub, raw' });
+
+  const directHeavenId = !id.startsWith('mal-') && !/^\d+$/.test(id);
+  const anilistId = directHeavenId || id.startsWith('mal-') ? undefined : id;
+  const malId = id.startsWith('mal-') ? id.replace('mal-', '') : undefined;
+
+  try {
+    const siteIds = directHeavenId
+      ? { anilistId: null, malId: null, title: null, siteIds: { animeheaven: id } }
+      : await resolveSiteIds(anilistId, malId);
+    if (!siteIds) return res.status(404).json({ error: 'Could not resolve anime' });
+
+    const epResult = await fetchEpisodes('animeheaven', siteIds, {});
+    if (epResult.error) return res.status(404).json({ error: epResult.error });
+
+    const episode = epResult.episodes.find((e: any) => Math.round(e.num) === epNum);
+    if (!episode) return res.status(404).json({ error: `Episode ${epNum} not found` });
+
+    const allServers = await getHeavenServers(episode.id);
+
+    const filtered = type === 'all'
+      ? allServers
+      : allServers.filter((s: any) => s.type === type);
+    if (!filtered.length) return res.status(404).json({ error: `No ${type} stream available on animeheaven for ep ${epNum}` });
+
+    let embedResult: any = null;
+    for (const server of filtered) {
+      const raw = await getHeavenStream(server.sourceId);
+      if (raw && raw.mp4) { embedResult = raw; break; }
+    }
+    
+    if (!embedResult || !embedResult.mp4) {
+      return res.status(502).json({ error: 'Failed to extract direct MP4 link from servers' });
+    }
+
+    const mp4Url = embedResult.mp4;
+
+    const upstream = await axios.get(mp4Url, {
+      responseType: 'stream',
+      timeout: 20000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Referer': 'https://animeheaven.me/',
+        'Origin': 'https://animeheaven.me',
+        ...(req.headers.range ? { Range: req.headers.range } : {}),
+      },
+      validateStatus: (status) => (status >= 200 && status < 300) || status === 206,
+    });
+
+    res.status(upstream.status);
+    res.setHeader('Content-Disposition', 'attachment; filename="episode.mp4"');
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    const acceptRanges = upstream.headers['accept-ranges'];
+    if (acceptRanges) {
+      res.setHeader('Accept-Ranges', typeof acceptRanges === 'string' ? acceptRanges : 'bytes');
+    }
+
+    for (const header of ['content-length', 'content-range', 'etag', 'last-modified']) {
+      const value = upstream.headers[header];
+      if (typeof value === 'string' || typeof value === 'number' || Array.isArray(value)) {
+        res.setHeader(header, value);
+      }
+    }
+
+    return upstream.data.pipe(res);
+
+  } catch (e: any) {
+    console.error(`[/download/animeheaven]`, e);
+    return res.status(500).json({ error: 'Download failed', detail: String(e) });
+  }
+}
+
+router.get('/download/animeheaven/:id/:ep/:type', downloadHeavenHandler);
+
 router.get('/proxy/hls', async (req: Request, res: Response) => {
   const url = req.query.url as string | undefined;
   const ref = req.query.ref as string | undefined;
